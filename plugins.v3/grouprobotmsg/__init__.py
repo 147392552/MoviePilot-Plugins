@@ -75,8 +75,34 @@ class GroupRobotMsg(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """当前插件不注册后端 API。"""
-        return []
+        """注册测试发送 API。"""
+        return [
+            {
+                "path": "/test",
+                "endpoint": self.api_test,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "发送测试消息到群机器人",
+            },
+        ]
+
+    def api_test(self, title: str = None, text: str = None) -> Dict[str, Any]:
+        """手动发送测试消息，验证钉钉/飞书配置。"""
+        t = title or "MoviePilot 测试消息"
+        x = text or (
+            "**MoviePilot 群机器人通知测试**\n\n"
+            "如果你在群里看到这条消息，说明通知链路已通。\n\n"
+            f"发送时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        results = {}
+        if self._dingtalk_token:
+            results["dingtalk"] = self._send_dingtalk(t, x)
+        if self._feishu_webhook:
+            results["feishu"] = self._send_feishu(t, x)
+        if not results:
+            return {"success": False, "message": "未配置任何群机器人"}
+        ok = all(results.values())
+        return {"success": ok, "message": results}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """拼装插件配置页面。"""
