@@ -28,7 +28,7 @@ class GroupRobotMsg(_PluginBase):
     plugin_name = "群机器人通知"
     plugin_desc = "支持将消息通知发送到钉钉群机器人或飞书群机器人（可同时配置）。"
     plugin_icon = "Tang_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.2"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/147392552"
     plugin_config_prefix = "grouprobotmsg_"
