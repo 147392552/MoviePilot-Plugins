@@ -294,7 +294,8 @@ class GroupRobotMsg(_PluginBase):
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(
-            string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
+            secret.encode("utf-8"), string_to_sign.encode("utf-8"),
+            digestmod=hashlib.sha256
         ).digest()
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
         return timestamp, sign
