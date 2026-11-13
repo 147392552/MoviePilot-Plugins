@@ -29,7 +29,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -377,10 +377,12 @@ class TangGrabPacket(_PluginBase):
         except ValueError:
             return False, f"非JSON响应 HTTP {r.status_code}", "-"
         if r.status_code == 200 and res.get("ok") is not False:
-            magic = res.get("magic") or res.get("amount") or res.get("bonus")
+            magic = (res.get("magic_amount") or res.get("magic")
+                     or res.get("amount") or res.get("bonus"))
             if magic is None and isinstance(res.get("data"), dict):
                 d = res["data"]
-                magic = d.get("magic") or d.get("amount") or d.get("bonus")
+                magic = (d.get("magic_amount") or d.get("magic")
+                         or d.get("amount") or d.get("bonus"))
             return True, "", str(magic if magic is not None else "-")
         msg = str(res.get("message") or res.get("msg") or f"HTTP {r.status_code}")
         if st := self._antibot:
