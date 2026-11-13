@@ -3,12 +3,13 @@
   "name": "不可躺抢红包",
   "description": "自动监控不可躺PT站红包并自动拆取：PoW验证、去重、每日上限休眠、微信推送。",
   "labels": "站点,自动化",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "WorkBuddy",
   "level": 1,
   "v3": true,
   "history": {
-   "v1.0.0": "首个版本：自动抢红包，PoW验证，通知推送。"
+   "v1.0.0": "首个版本：自动抢红包，PoW验证，通知推送。",
+   "v1.0.1": "修复站点域名匹配(www前缀导致Cookie获取失败)；失败时输出日志。"
   }
  },
  "GroupRobotMsg": {
