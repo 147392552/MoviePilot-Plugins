@@ -29,14 +29,14 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
     plugin_order = 31
     auth_level = 1
 
-    SITE_DOMAIN = "www.tangpt.top"
+    SITE_DOMAIN = "tangpt.top"
     API_BASE = "https://www.tangpt.top"
     REFERER = "https://www.tangpt.top/index.php"
 
@@ -140,6 +140,8 @@ class TangGrabPacket(_PluginBase):
             site = SiteOper().get_by_domain(self.SITE_DOMAIN)
             if site and site.cookie:
                 return site.cookie
+            logger.warning(
+                f"不可躺抢红包：站点库中未找到域名 {self.SITE_DOMAIN} 的记录，请检查站点配置")
         except Exception as err:
             logger.error(f"不可躺抢红包：获取站点Cookie异常：{err}")
         return ""
