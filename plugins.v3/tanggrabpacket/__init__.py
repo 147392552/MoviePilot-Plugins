@@ -29,7 +29,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -42,7 +42,7 @@ class TangGrabPacket(_PluginBase):
 
     _enabled = False
     _interval = 90
-    _max_per_day = 100
+    _max_per_day = 0  # 0 = 不设上限，完全由站点返回的「已达上限」决定何时停止
     _notify = True
     _cookie = ""
     _onlyonce = False
@@ -58,12 +58,20 @@ class TangGrabPacket(_PluginBase):
     _today_count = 0
     _daily_limited = False
     _cooldown_until = 0.0
+    # 站点侧「今日已达领取上限」的拒绝文案；规则由站点随时调整，插件不写死数字
+    # 只认「账号级次数/上限」文案，避免把「这个红包已领完」误判成全天停摆
+    _LIMIT_KEYWORDS = (
+        "最多领取", "最多领", "领取上限", "每日上限", "今日上限", "已达上限",
+        "达到上限", "超过上限", "已达每日", "已达今日", "今日已领满", "今日已达",
+        "领取次数", "次数已用完", "次数用完", "每天最多", "每日最多", "已达领取",
+        "daily limit", "daily_limit", "limit reached", "quota exceeded", "too many",
+    )
 
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
         self._interval = self.__safe_int(config.get("interval"), 90, min_value=30)
-        self._max_per_day = self.__safe_int(config.get("max_per_day"), 100, min_value=1)
+        self._max_per_day = self.__safe_int(config.get("max_per_day"), 0, min_value=0)
         self._notify = bool(config.get("notify", True))
         self._cookie = (config.get("cookie") or self.__get_site_cookie() or "").strip()
         self._onlyonce = bool(config.get("onlyonce", False))
@@ -303,7 +311,7 @@ class TangGrabPacket(_PluginBase):
             grabbed = []
             skipped = []
             for it in todo:
-                if self._today_count >= self._max_per_day:
+                if self._max_per_day > 0 and self._today_count >= self._max_per_day:
                     break
                 pid = it.get("id")
                 ok, msg, magic = self.__claim(pid)
@@ -313,11 +321,13 @@ class TangGrabPacket(_PluginBase):
                     self.__save_state()
                     grabbed.append({"id": pid, "sender": it.get("sender"),
                                     "magic": magic, "message": it.get("message")})
+                    limit_note = (f"/{self._max_per_day}" if self._max_per_day > 0
+                                  else " · 不设上限")
                     self.__notify(
                         "【不可躺抢红包】拆到一个！",
                         f"红包 #{pid}\n发件人：{it.get('sender')}\n"
                         f"金额：{magic}\n祝福：{it.get('message') or '-'}\n"
-                        f"今日已领：{self._today_count}/{self._max_per_day}"
+                        f"今日已领：{self._today_count}{limit_note}"
                     )
                     # 人性化间隔（用户指定10-20秒），避免触发站点风控
                     time.sleep(random.uniform(10, 20))
@@ -330,15 +340,26 @@ class TangGrabPacket(_PluginBase):
                         logger.info(f"不可躺抢红包：触发站点风控（{msg}），冷却{int(self._cooldown_until - time.time())}秒后重试")
                         skipped.append({"id": pid, "reason": msg})
                         break
-                    self._claimed_ids.add(str(pid))
-                    self.__save_state()
                     skipped.append({"id": pid, "reason": msg})
-                    if "最多领" in msg or "领取100个" in msg:
+                    # 站点明确说「今日已达上限」→ 当天停止；该红包不标记，明天仍可重试
+                    if self.__is_daily_limit(msg):
                         self._daily_limited = True
                         self.__save_state()
+                        logger.info(
+                            f"不可躺抢红包：站点返回领取上限（{msg}），"
+                            f"今日已领 {self._today_count} 个，明天 0 点自动恢复"
+                        )
+                        self.__notify(
+                            "【不可躺抢红包】今日已达站点领取上限",
+                            f"站点返回：{msg}\n今日已领 {self._today_count} 个\n"
+                            f"已停止领取，明天 0 点自动恢复"
+                        )
                         break
                     if "登录" in msg or "失效" in msg or "cookie" in msg.lower():
                         return {"success": False, "message": f"Cookie疑似失效：{msg}"}
+                    # 其余为该红包自身的确定性失败（已领过/已领完/已过期），标记去重
+                    self._claimed_ids.add(str(pid))
+                    self.__save_state()
                     time.sleep(random.uniform(1, 2))
 
             summary = f"本轮领取 {len(grabbed)} 个，跳过 {len(skipped)} 个，今日累计 {self._today_count} 个"
@@ -346,6 +367,12 @@ class TangGrabPacket(_PluginBase):
                 logger.info(f"不可躺抢红包：{summary}")
             return {"success": True, "message": summary,
                     "grabbed": grabbed, "skipped": skipped}
+
+    @classmethod
+    def __is_daily_limit(cls, msg: str) -> bool:
+        """站点返回「不让领了」才停：以站点文案为准，不依赖写死的每日数字。"""
+        text = str(msg or "").lower()
+        return any(k in text for k in cls._LIMIT_KEYWORDS)
 
     def __claim(self, pid) -> Tuple[bool, str, str]:
         token, err = self.__use_token()
@@ -457,8 +484,8 @@ class TangGrabPacket(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "max_per_day",
-                                            "label": "每日最多领取数",
-                                            "hint": "站点限制每天100个",
+                                            "label": "每日最多领取数（0=不限制）",
+                                            "hint": "0 或留空 = 不设上限；站点返回「已达上限」时自动停止（站点规则可能每日调整）",
                                             "persistent-hint": True
                                         }
                                     }
@@ -494,6 +521,10 @@ class TangGrabPacket(_PluginBase):
     def get_page(self) -> List[dict]:
         results = self.get_data("grab_state") or {}
         history_note = f"今日已领取 {results.get('today_count') or 0} 个"
+        if results.get("daily_limited"):
+            history_note += " · 站点已达上限，明天 0 点自动恢复"
+        elif not self._max_per_day:
+            history_note += " · 不设上限（站点说了算）"
         return [
             {
                 "component": "VCard",
