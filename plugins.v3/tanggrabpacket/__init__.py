@@ -29,7 +29,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -57,6 +57,7 @@ class TangGrabPacket(_PluginBase):
     _today = ""
     _today_count = 0
     _daily_limited = False
+    _cooldown_until = 0.0
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -73,6 +74,7 @@ class TangGrabPacket(_PluginBase):
         self._today_count = int(data.get("today_count") or 0)
         self._claimed_ids = set(data.get("claimed_ids") or [])
         self._daily_limited = bool(data.get("daily_limited", False))
+        self._cooldown_until = float(data.get("cooldown_until") or 0)
         today = datetime.now().strftime("%Y-%m-%d")
         if self._today != today:
             self._today = today
@@ -224,7 +226,8 @@ class TangGrabPacket(_PluginBase):
             return "", "PoW求解超时"
         try:
             v = s.post(f"{self.API_BASE}/api/redpacket/antibot/verify",
-                       data={"challenge_id": cid, "mode": "pow", "nonce": nonce, "confirm": 0},
+                       data={"challenge_id": cid, "mode": "pow", "nonce": nonce,
+                             "confirm": 1 if ch.get("require_confirm") else 0},
                        headers=headers, timeout=20).json()
         except Exception as err:
             return "", f"验证确认请求失败：{err}"
@@ -255,6 +258,7 @@ class TangGrabPacket(_PluginBase):
             "today_count": self._today_count,
             "claimed_ids": list(self._claimed_ids)[-1000:],
             "daily_limited": self._daily_limited,
+            "cooldown_until": self._cooldown_until,
         })
 
     def __notify(self, title: str, text: str):
@@ -281,6 +285,9 @@ class TangGrabPacket(_PluginBase):
                 self._daily_limited = False
             if self._daily_limited:
                 return {"success": True, "message": f"今日已领满{self._today_count}个，明天继续"}
+            if time.time() < self._cooldown_until:
+                return {"success": True,
+                        "message": f"风控冷却中，剩余{int(self._cooldown_until - time.time())}秒"}
 
             try:
                 lat = s.get(f"{self.API_BASE}/api/redpacket/latest", timeout=20).json()
@@ -312,9 +319,17 @@ class TangGrabPacket(_PluginBase):
                         f"金额：{magic}\n祝福：{it.get('message') or '-'}\n"
                         f"今日已领：{self._today_count}/{self._max_per_day}"
                     )
-                    # 人性化间隔，避免触发站点风控
-                    time.sleep(random.uniform(2, 5))
+                    # 人性化间隔（用户指定10-20秒），避免触发站点风控
+                    time.sleep(random.uniform(10, 20))
                 else:
+                    # 站点风控升级（turnstile/人机验证/需勾选本人操作）：退避冷却，
+                    # 该红包不标记已领，冷却后自动重试
+                    if any(k in msg for k in ("turnstile", "人机", "验证", "勾选", "本人操作")):
+                        self._cooldown_until = time.time() + random.uniform(480, 900)
+                        self.__save_state()
+                        logger.info(f"不可躺抢红包：触发站点风控（{msg}），冷却{int(self._cooldown_until - time.time())}秒后重试")
+                        skipped.append({"id": pid, "reason": msg})
+                        break
                     self._claimed_ids.add(str(pid))
                     self.__save_state()
                     skipped.append({"id": pid, "reason": msg})
