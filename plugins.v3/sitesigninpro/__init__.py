@@ -14,6 +14,9 @@ MoviePilot 自带 AutoSignIn 只会 GET attendance.php 然后读页面文案，
   4. 以站点返回的「签到成功 / 本次签到获得 / 签到已得N」为准判定结果
   5. 每日定时签到 + 定时补签巡检（只补当天未成功的站，已签不重复提交）
   6. 只在「需要手动处理」时发一条钉钉提醒（按站点按天去重，不刷屏）
+  7. 支持「主页链接式签到」：学校 BTSCHOOL 等站点没有 attendance.php，
+     签到入口是首页红色「每日签到」-> index.php?action=addbonus，
+     提交后以按钮消失为成功凭据（v1.2.0 起）
 """
 import base64
 import hashlib
@@ -49,6 +52,10 @@ _HEADERS = {
 }
 _DEFAULT_DOMAINS = "hdbao.cc,tangpt.top,crabpt.vip,bilibili.download"
 _DINGTALK_SEND_URL = "https://oapi.dingtalk.com/robot/send"
+# 已知「主页链接式签到」站点：没有 attendance.php，签到入口直接放在首页
+_HOME_SIGN_DOMAINS = ("btschool",)
+# 状态结构版本：插件升级后清掉旧的「无签到功能/失败」记录，保留已签记录
+_STATE_ENGINE = "1.2.0"
 
 
 # ----------------------------------------------------------------------
@@ -125,6 +132,41 @@ def find_sign_form(source: str, base_url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def find_home_sign_link(source: str, base_url: str) -> Optional[str]:
+    """找出「主页链接式签到」入口，例如学校：
+       <a href="index.php?action=addbonus"><font color="white">每日签到</font></a>
+       只有「链接文字明确是签到且很短」或「链接本身是签到接口」才认，
+       避免把导航里的论坛签到帖、说明文字误判成签到按钮。"""
+    if not source:
+        return None
+    for match in re.finditer(
+            r"(?is)<a\b[^>]*href\s*=\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>", source):
+        href = html_lib.unescape(match.group(1) or "").strip()
+        text = plain_text(match.group(2))
+        low = href.lower()
+        if low.startswith(("javascript:", "#", "mailto:")):
+            continue
+        tight = re.sub(r"\s+", "", text)
+        text_hit = bool(re.fullmatch(
+            r"(每日|立即|马上|点击|点此)?[签簽]到|每日?打卡|打卡|checkin", tight, re.I))
+        href_hit = bool(re.search(
+            r"addbonus|attendance|checkin|check_in|signin|sign\.php|qiandao", low))
+        if text_hit or href_hit:
+            return urljoin(base_url or "", href)
+    return None
+
+
+def has_home_sign_marker(source: str) -> bool:
+    """页面里是否留有签到功能痕迹，用于区分「今天已签」与「本来就没签到功能」"""
+    if not source:
+        return False
+    if find_home_sign_link(source, ""):
+        return True
+    return bool(re.search(
+        r"每\s*日\s*[签簽]\s*到|action=addbonus|attendance\.php|签到成功|签到已得|本次签到获得",
+        source, re.I))
+
+
 def parse_cookie(raw: str) -> List[Dict[str, str]]:
     """把 'k=v; k2=v2' 解析成 playwright 需要的 cookie 列表"""
     out = []
@@ -142,9 +184,9 @@ class SiteSigninPro(_PluginBase):
     """真正提交签到表单的站点签到助手"""
 
     plugin_name = "站点签到助手"
-    plugin_desc = "站点下拉多选（自动包含新增站点），真正提交「立即签到」表单（含 Cloudflare 人机验证站点），按站点返回的奖励文案判定签到结果"
+    plugin_desc = "站点下拉多选（自动包含新增站点），支持 attendance.php 表单签到、Cloudflare 人机验证签到，以及学校等站的「主页每日签到」链接；按奖励文案或签到按钮消失判定结果"
     plugin_icon = "check.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "WorkBuddy"
     plugin_config_prefix = "sitesigninpro_"
     plugin_order = 33
@@ -166,6 +208,7 @@ class SiteSigninPro(_PluginBase):
     _dingtalk_secret = ""
     _notify_fail = True
     _notify_daily = False
+    _home_support = set()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -233,6 +276,7 @@ class SiteSigninPro(_PluginBase):
         self._dingtalk_secret = str(config.get("dingtalk_secret") or "").strip()
         self._notify_fail = bool(config.get("notify_fail", True))
         self._notify_daily = bool(config.get("notify_daily", False))
+        self._home_support = set()
 
         run_now = bool(config.get("onlyonce"))
         test_now = bool(config.get("test_notify"))
@@ -539,22 +583,67 @@ class SiteSigninPro(_PluginBase):
         return {"error": "浏览器组件不可用或人机验证未通过"}
 
     # ------------------------------------------------------------------
+    # 主页链接式签到（学校 BTSCHOOL）
+    # ------------------------------------------------------------------
+    def __home_sign(self, site: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+        """GET 首页 -> 找红色「每日签到」链接 -> 打开链接提交 ->
+        带随机参数复查首页，按钮消失才算成功。全程只 GET，不重复提交。"""
+        home = site["url"].rstrip("/") + "/"
+        try:
+            res = self.__http(site, "GET", home)
+            if res is None or res.status_code != 200:
+                return {**base, "status": "error",
+                        "detail": f"打开主页失败 HTTP {getattr(res, 'status_code', '无响应')}"}
+            html = res.text
+            if not is_logged_in(html):
+                return {**base, "status": "error", "detail": "Cookie 已失效，请在站点管理更新"}
+            link = find_home_sign_link(html, getattr(res, "url", None) or home)
+            if not link:
+                if site["domain"] in self._home_support or has_home_sign_marker(html):
+                    return {**base, "status": "already", "method": "主页确认",
+                            "detail": "今日已签到（主页「每日签到」按钮已消失）"}
+                return {**base, "status": "unsupported",
+                        "detail": "主页也没有签到入口，已自动跳过"}
+            self._home_support.add(site["domain"])
+            act = self.__http(site, "GET", link)
+            action_html = act.text if act is not None else ""
+            # 带随机参数复查，避免缓存把旧首页当成签到后的首页
+            check_url = home + ("&" if "?" in home else "?") + "_=" + str(int(time.time()))
+            verify = self.__http(site, "GET", check_url)
+            verified = verify.text if verify is not None else ""
+            if not find_home_sign_link(verified, check_url):
+                return {**base, "status": "success", "method": "主页签到链接(GET)",
+                        "reward": extract_reward(action_html) or extract_reward(verified),
+                        "detail": "已提交主页签到，红色「每日签到」按钮已消失"}
+            hint = plain_text(action_html)[:100]
+            return {**base, "status": "error", "method": "主页签到链接(GET)",
+                    "detail": f"提交后主页仍显示签到按钮：{hint or '无返回内容'}"}
+        except Exception as err:
+            return {**base, "status": "error", "detail": f"{type(err).__name__}: {str(err)[:120]}"}
+
+    # ------------------------------------------------------------------
     # 单站签到
     # ------------------------------------------------------------------
     def __sign_site(self, site: Dict[str, Any]) -> Dict[str, Any]:
         now = datetime.now().strftime("%H:%M:%S")
-        base = {"site": site["name"], "domain": site["domain"], "time": now,
-                "url": urljoin(site["url"].rstrip("/") + "/", "attendance.php")}
+        home = site["url"].rstrip("/") + "/"
+        att = urljoin(home, "attendance.php")
+        base = {"site": site["name"], "domain": site["domain"], "time": now, "url": home}
         if not site.get("cookie"):
             return {**base, "status": "error", "detail": "站点管理里没有 Cookie（或手工 Cookie 未填）"}
-        att = base["url"]
+        # 学校这类站点根本没有 attendance.php，签到入口就在首页
+        if any(key in site["domain"] for key in _HOME_SIGN_DOMAINS):
+            return self.__home_sign(site, base)
         try:
             res = self.__http(site, "GET", att)
             if res is None or res.status_code != 200:
-                # 学校等没有签到功能的站点直接跳过，不算失败、不发钉钉
+                # 404 不等于没有签到功能，先探测主页式签到入口
                 if res is not None and res.status_code == 404:
+                    home_result = self.__home_sign(site, base)
+                    if home_result.get("status") in ("success", "already"):
+                        return home_result
                     return {**base, "status": "unsupported",
-                            "detail": "该站没有签到页（HTTP 404），已自动跳过"}
+                            "detail": "没有 attendance.php，主页也没有签到入口，已自动跳过"}
                 return {**base, "status": "error",
                         "detail": f"打开签到页失败 HTTP {getattr(res, 'status_code', '无响应')}"}
             source = res.text
@@ -572,6 +661,10 @@ class SiteSigninPro(_PluginBase):
                 if res2 is not None and is_signed(res2.text):
                     return {**base, "status": "success", "method": "GET 触发签到",
                             "reward": extract_reward(res2.text), "detail": "GET 签到成功"}
+                # 兜底：少数新站的签到入口不在 attendance.php 而在首页
+                home_result = self.__home_sign(site, base)
+                if home_result.get("status") in ("success", "already"):
+                    return home_result
                 if not re.search(r"签\s*到|簽\s*到|attendance|check.?in", plain_text(source), re.I):
                     return {**base, "status": "unsupported",
                             "detail": "该站没有签到功能，已自动跳过"}
@@ -676,7 +769,17 @@ class SiteSigninPro(_PluginBase):
         today = datetime.now().strftime("%Y-%m-%d")
         state = self.get_data("sign_state") or {}
         if state.get("date") != today:
-            state = {"date": today, "sites": {}, "notified": [], "daily_notified": False}
+            state = {"date": today, "engine": _STATE_ENGINE, "sites": {},
+                     "notified": [], "daily_notified": False}
+        elif state.get("engine") != _STATE_ENGINE:
+            # 插件升级：旧版把学校误判成「无签到功能」，这里清掉失败/跳过记录
+            # 让新策略重新检查；已确认签到的记录保留，绝不重复提交表单。
+            keep = {k: v for k, v in (state.get("sites") or {}).items()
+                    if v.get("status") in ("success", "already")}
+            state["engine"] = _STATE_ENGINE
+            state["sites"] = keep
+            state["notified"] = []
+        self._home_support = set(state.get("home_support") or [])
         known: Dict[str, Any] = state.get("sites") or {}
         sites = self.__sites()
         if not sites:
@@ -706,6 +809,7 @@ class SiteSigninPro(_PluginBase):
                         f" {result.get('reward') or ''}")
 
         state["sites"] = known
+        state["home_support"] = sorted(self._home_support)
         state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.save_data("sign_state", state)
         self.__notify(state, results, daily=force)
@@ -793,10 +897,11 @@ class SiteSigninPro(_PluginBase):
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal",
                                 "text": "站点直接从「站点管理」读取，新增站点会自动出现在上面的下拉里。"
-                                        "本插件真正提交「立即签到」表单：无验证码的站点走 POST；"
-                                        "带 Cloudflare Turnstile 的站点用浏览器过验证后点击。"
-                                        "以站点返回的「签到成功 / 本次签到获得 / 签到已得N」为准判定，"
-                                        "不会把按钮或说明文字误判成成功；无签到页的站点自动跳过不报警。"}}]},
+                                        "本插件真正完成签到：无验证码的站点提交「立即签到」表单；"
+                                        "带 Cloudflare Turnstile 的站点用浏览器过验证后点击；"
+                                        "学校这类没有 attendance.php 的站点，会打开首页的红色「每日签到」链接，"
+                                        "并以按钮消失为成功凭据。以站点返回的奖励文案/按钮状态判定，"
+                                        "不会把说明文字误判成成功；确实没有签到入口的站点自动跳过不报警。"}}]},
                     ]},
                 ],
             }
