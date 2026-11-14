@@ -142,9 +142,9 @@ class SiteSigninPro(_PluginBase):
     """真正提交签到表单的站点签到助手"""
 
     plugin_name = "站点签到助手"
-    plugin_desc = "自动提交「立即签到」表单（含 Cloudflare 人机验证站点），按站点返回的奖励文案判定签到结果"
+    plugin_desc = "站点下拉多选（自动包含新增站点），真正提交「立即签到」表单（含 Cloudflare 人机验证站点），按站点返回的奖励文案判定签到结果"
     plugin_icon = "check.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "WorkBuddy"
     plugin_config_prefix = "sitesigninpro_"
     plugin_order = 33
@@ -159,6 +159,8 @@ class SiteSigninPro(_PluginBase):
     _cron_minute = 55
     _retry_minutes = 60
     _domains_text = _DEFAULT_DOMAINS
+    _sign_sites: List[Any] = []
+    _ALL_SITES = "__all__"
     _manual_cookies = ""
     _dingtalk_token = ""
     _dingtalk_secret = ""
@@ -202,6 +204,7 @@ class SiteSigninPro(_PluginBase):
             "cron_minute": self._cron_minute,
             "retry_minutes": self._retry_minutes,
             "domains": self._domains_text,
+            "sign_sites": self._sign_sites,
             "manual_cookies": self._manual_cookies,
             "dingtalk_token": self._dingtalk_token,
             "dingtalk_secret": self._dingtalk_secret,
@@ -219,6 +222,12 @@ class SiteSigninPro(_PluginBase):
         self._cron_minute = self.__safe_int(config.get("cron_minute"), 55, 0, 59)
         self._retry_minutes = self.__safe_int(config.get("retry_minutes"), 60, 15, 720)
         self._domains_text = config.get("domains") or _DEFAULT_DOMAINS
+        self._sign_sites = config.get("sign_sites") or []
+        # 过滤掉已从站点管理删除的站点 ID，避免残留配置指向不存在的站
+        if self._sign_sites and self._ALL_SITES not in self._sign_sites:
+            valid = {str(o["value"]) for o in self.__site_options()
+                     if o["value"] != self._ALL_SITES}
+            self._sign_sites = [x for x in self._sign_sites if str(x) in valid]
         self._manual_cookies = config.get("manual_cookies") or ""
         self._dingtalk_token = self.__clean_token(config.get("dingtalk_token"))
         self._dingtalk_secret = str(config.get("dingtalk_secret") or "").strip()
@@ -238,7 +247,7 @@ class SiteSigninPro(_PluginBase):
 
         logger.info(
             f"站点签到助手初始化完成：启用={self._enabled}，每日 {self._cron_hour:02d}:{self._cron_minute:02d}，"
-            f"补签巡检每 {self._retry_minutes} 分钟，目标站点={len(self.__targets())} 个"
+            f"补签巡检每 {self._retry_minutes} 分钟，目标站点={len(self.__sites())} 个"
         )
 
     def get_state(self) -> bool:
@@ -305,23 +314,12 @@ class SiteSigninPro(_PluginBase):
     # 站点数据来源：MoviePilot 站点管理
     # ------------------------------------------------------------------
     def __targets(self) -> List[str]:
+        """旧版域名配置兜底；新版优先使用站点多选 ID"""
         return [x.strip().lower() for x in re.split(r"[,，\s]+", self._domains_text or "") if x.strip()]
 
-    @staticmethod
-    def __field(obj, key: str):
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    def __sites(self) -> List[Dict[str, Any]]:
-        targets = self.__targets()
-        manual: Dict[str, str] = {}
-        for line in (self._manual_cookies or "").splitlines():
-            if "|" in line:
-                domain, cookie = line.split("|", 1)
-                manual[domain.strip().lower()] = cookie.strip()
-
-        raw = []
+    @classmethod
+    def __site_rows(cls) -> List[Any]:
+        """从站点管理读取全部站点对象（含 ID），多版本 MoviePilot 兼容"""
         SiteOper = None
         for module in ("app.db.oper.site", "app.db.siteoper", "app.db.oper"):
             try:
@@ -331,20 +329,66 @@ class SiteSigninPro(_PluginBase):
                     break
             except Exception:
                 continue
-        if SiteOper:
-            try:
-                raw = SiteOper().list_order_by_pri() or []
-            except Exception as err:
-                logger.warn(f"站点签到助手读取站点管理失败：{err}")
-        else:
-            logger.warn("站点签到助手未能加载 SiteOper，只能使用手工 Cookie 配置")
+        if not SiteOper:
+            return []
+        try:
+            return list(SiteOper().list_order_by_pri() or [])
+        except Exception as err:
+            logger.warn(f"站点签到助手读取站点管理失败：{err}")
+            return []
+
+    @classmethod
+    def __site_options(cls) -> List[Dict[str, Any]]:
+        """配置页下拉项：全部 + 站点管理里的每一个站点（新增站点自动出现）"""
+        options = [{"title": "全部站点（含以后新增）", "value": cls._ALL_SITES}]
+        for item in cls.__site_rows():
+            sid = cls.__field(item, "id")
+            name = cls.__field(item, "name")
+            if sid is not None:
+                options.append({"title": str(name or sid), "value": sid})
+        return options
+
+    def __selected_ids(self) -> List[str]:
+        """展开「全部站点」，返回当前选中的站点 ID（统一成字符串比较）"""
+        if self._ALL_SITES in (self._sign_sites or []):
+            return [str(o["value"]) for o in self.__site_options()
+                    if o["value"] != self._ALL_SITES]
+        return [str(x) for x in (self._sign_sites or [])]
+
+    @staticmethod
+    def __field(obj, key: str):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def __sites(self) -> List[Dict[str, Any]]:
+        """按配置页多选的站点 ID 取站点；未配置多选时回落旧版域名列表"""
+        manual: Dict[str, str] = {}
+        for line in (self._manual_cookies or "").splitlines():
+            if "|" in line:
+                domain, cookie = line.split("|", 1)
+                manual[domain.strip().lower()] = cookie.strip()
+
+        raw = self.__site_rows()
+        if not raw:
+            logger.warn("站点签到助手未能读取站点管理，只能使用手工 Cookie 配置")
+
+        use_ids = bool(self._sign_sites)
+        selected = set(self.__selected_ids())
+        targets = set(self.__targets())
 
         sites: List[Dict[str, Any]] = []
         seen = set()
         for item in raw:
+            sid = str(self.__field(item, "id") or "")
             domain = str(self.__field(item, "domain") or "").strip().lower()
             domain = re.sub(r"^https?://", "", domain).strip("/")
-            if domain not in targets or domain in seen:
+            if not domain or domain in seen:
+                continue
+            if use_ids:
+                if sid not in selected:
+                    continue
+            elif domain not in targets:
                 continue
             cookie = str(self.__field(item, "cookie") or "").strip() or manual.get(domain, "")
             url = str(self.__field(item, "url") or ("https://" + domain + "/")).strip()
@@ -356,11 +400,12 @@ class SiteSigninPro(_PluginBase):
                 "ua": str(self.__field(item, "ua") or "").strip() or _UA,
             })
             seen.add(domain)
-        for domain in targets:
-            if domain not in seen and manual.get(domain):
+        # 手工 Cookie 里额外追加的站点始终纳入，方便临时加站
+        for domain, cookie in manual.items():
+            if domain and domain not in seen:
                 sites.append({
                     "domain": domain, "name": domain,
-                    "url": "https://" + domain + "/", "cookie": manual[domain], "ua": _UA,
+                    "url": "https://" + domain + "/", "cookie": cookie, "ua": _UA,
                 })
         return sites
 
@@ -506,6 +551,10 @@ class SiteSigninPro(_PluginBase):
         try:
             res = self.__http(site, "GET", att)
             if res is None or res.status_code != 200:
+                # 学校等没有签到功能的站点直接跳过，不算失败、不发钉钉
+                if res is not None and res.status_code == 404:
+                    return {**base, "status": "unsupported",
+                            "detail": "该站没有签到页（HTTP 404），已自动跳过"}
                 return {**base, "status": "error",
                         "detail": f"打开签到页失败 HTTP {getattr(res, 'status_code', '无响应')}"}
             source = res.text
@@ -523,6 +572,9 @@ class SiteSigninPro(_PluginBase):
                 if res2 is not None and is_signed(res2.text):
                     return {**base, "status": "success", "method": "GET 触发签到",
                             "reward": extract_reward(res2.text), "detail": "GET 签到成功"}
+                if not re.search(r"签\s*到|簽\s*到|attendance|check.?in", plain_text(source), re.I):
+                    return {**base, "status": "unsupported",
+                            "detail": "该站没有签到功能，已自动跳过"}
                 return {**base, "status": "unknown", "detail": "签到页没有表单，也没有成功凭据"}
 
             if not form["turnstile"]:
@@ -633,7 +685,8 @@ class SiteSigninPro(_PluginBase):
 
         # 无论定时、巡检还是手动立即运行，今天已确认签到的站点都不再重复提交表单
         pending = [s for s in sites
-                   if (known.get(s["domain"]) or {}).get("status") not in ("success", "already")]
+                   if (known.get(s["domain"]) or {}).get("status")
+                   not in ("success", "already", "unsupported")]
         skipped = len(sites) - len(pending)
         if not pending:
             logger.info(f"站点签到助手：今日 {len(sites)} 站均已签到，跳过（不重复提交表单）")
@@ -647,7 +700,8 @@ class SiteSigninPro(_PluginBase):
             results.append(result)
             known[result["domain"]] = result
             label = {"success": "签到成功", "already": "今日已签", "manual": "需手动处理",
-                     "error": "失败", "unknown": "无法判定"}.get(result["status"], result["status"])
+                     "error": "失败", "unknown": "无法判定",
+                     "unsupported": "无签到功能(跳过)"}.get(result["status"], result["status"])
             logger.info(f"站点签到助手 [{label}] {result['site']}：{result['detail']}"
                         f" {result.get('reward') or ''}")
 
@@ -710,12 +764,17 @@ class SiteSigninPro(_PluginBase):
                                 "model": "dingtalk_secret", "label": "钉钉加签密钥 SEC"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {
-                                "model": "domains", "label": "要签到的站点域名（逗号分隔）",
-                                "hint": "域名必须与站点管理中的 domain 一致；默认 4 站（学校无签到功能，已排除）",
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                            {"component": "VSelect", "props": {
+                                "chips": True,
+                                "multiple": True,
+                                "model": "sign_sites",
+                                "label": "签到站点",
+                                "items": self.__site_options(),
+                                "hint": "自动列出站点管理里的全部站点，以后新增的站点也会出现在这里；"
+                                        "选「全部站点」可一劳永逸，没有签到功能的站点会自动跳过",
                                 "persistent-hint": True}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {
                                 "model": "notify_daily", "label": "每天发签到日报",
                                 "hint": "默认关闭，避免刷屏；只在每日签到那一轮发一条汇总",
@@ -733,10 +792,11 @@ class SiteSigninPro(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal",
-                                "text": "本插件真正提交「立即签到」表单：无验证码的站点走 POST；"
+                                "text": "站点直接从「站点管理」读取，新增站点会自动出现在上面的下拉里。"
+                                        "本插件真正提交「立即签到」表单：无验证码的站点走 POST；"
                                         "带 Cloudflare Turnstile 的站点用浏览器过验证后点击。"
                                         "以站点返回的「签到成功 / 本次签到获得 / 签到已得N」为准判定，"
-                                        "不会把按钮或说明文字误判成成功。"}}]},
+                                        "不会把按钮或说明文字误判成成功；无签到页的站点自动跳过不报警。"}}]},
                     ]},
                 ],
             }
@@ -749,6 +809,7 @@ class SiteSigninPro(_PluginBase):
             "cron_minute": 55,
             "retry_minutes": 60,
             "domains": _DEFAULT_DOMAINS,
+            "sign_sites": [],
             "manual_cookies": "",
             "dingtalk_token": "",
             "dingtalk_secret": "",
@@ -759,11 +820,13 @@ class SiteSigninPro(_PluginBase):
     def get_page(self) -> List[dict]:
         state = self.get_data("sign_state") or {}
         records: Dict[str, Any] = state.get("sites") or {}
-        icons = {"success": "✅", "already": "✅", "manual": "🖐️", "error": "❌", "unknown": "❓"}
+        icons = {"success": "✅", "already": "✅", "manual": "🖐️", "error": "❌",
+                 "unknown": "❓", "unsupported": "⏭️"}
         labels = {"success": "签到成功", "already": "今日已签", "manual": "需手动处理",
-                  "error": "失败", "unknown": "无法判定"}
+                  "error": "失败", "unknown": "无法判定", "unsupported": "无签到功能(跳过)"}
         rows = []
-        for domain in self.__targets():
+        targets = [s["domain"] for s in self.__sites()]
+        for domain in targets:
             rec = records.get(domain) or {}
             status = rec.get("status") or "none"
             icon = icons.get(status, "⚪")
@@ -779,7 +842,7 @@ class SiteSigninPro(_PluginBase):
         head = (f"状态：{'运行中' if self._enabled else '未启用'} · "
                 f"每日 {self._cron_hour:02d}:{self._cron_minute:02d} 签到 · "
                 f"每 {self._retry_minutes} 分钟补签巡检 · "
-                f"{state.get('date') or '-'} 成功 {ok}/{len(self.__targets())} · "
+                f"{state.get('date') or '-'} 成功 {ok}/{len(targets)} · "
                 f"最近运行 {state.get('last_run') or '-'}")
         return [{
             "component": "VCard",
