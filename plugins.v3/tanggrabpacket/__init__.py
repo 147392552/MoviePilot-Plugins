@@ -2,6 +2,7 @@
 import hashlib
 import json
 import random
+import re
 import threading
 import time
 import uuid
@@ -29,7 +30,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.1.0"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -58,6 +59,15 @@ class TangGrabPacket(_PluginBase):
     _today_count = 0
     _daily_limited = False
     _cooldown_until = 0.0
+
+    # 统计台账（独立 key，不改动原有 grab_state）
+    _STATS_KEY = "grab_stats"
+    _STATS_MAX_DAYS = 400
+    # 一次性补记基线：v1.1.0 升级当天（2026-11-15）早间已领红包数由 grab_state 读出，
+    # 魔力合计取自当天群机器人汇总缓冲；更早的历史没有金额记录，不回溯。
+    _SEED_DAY = "2026-11-15"
+    _SEED_MAGIC = 3761057.0
+
     # 站点侧「今日已达领取上限」的拒绝文案；规则由站点随时调整，插件不写死数字
     # 只认「账号级次数/上限」文案，避免把「这个红包已领完」误判成全天停摆
     _LIMIT_KEYWORDS = (
@@ -89,6 +99,7 @@ class TangGrabPacket(_PluginBase):
             self._today_count = 0
             self._daily_limited = False
             self.__save_state()
+        self.__init_stats()
 
         if self._onlyonce:
             self._onlyonce = False
@@ -117,6 +128,13 @@ class TangGrabPacket(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "立即执行一轮抢红包",
+            },
+            {
+                "path": "/TangGrabPacket/stats",
+                "endpoint": self.__stats_api,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查看红包每日与累计统计台账（只读）",
             }
         ]
 
@@ -269,6 +287,110 @@ class TangGrabPacket(_PluginBase):
             "cooldown_until": self._cooldown_until,
         })
 
+    # ---------------- 统计台账 ----------------
+
+    @staticmethod
+    def __parse_magic(value) -> float:
+        """站点返回的金额可能是数字、'1,234'、'1234 魔力值' 或 '-'。"""
+        if value is None or isinstance(value, bool):
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(",", "").replace("，", "")
+        if not text or text in ("-", "--"):
+            return 0.0
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return 0.0
+        try:
+            return float(match.group())
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def __fmt_num(value) -> str:
+        try:
+            num = float(value or 0)
+        except (TypeError, ValueError):
+            return "0"
+        return f"{num:,.0f}" if abs(num - round(num)) < 1e-6 else f"{num:,.2f}"
+
+    def __save_stats(self, stats: Dict[str, Any]):
+        try:
+            self.save_data(self._STATS_KEY, stats)
+        except Exception as err:
+            logger.error(f"不可躺抢红包：统计台账写入失败：{err}")
+
+    def __init_stats(self):
+        """首次升级到 v1.1.0 时建立台账；当天已领的部分按汇总缓冲补记一次。"""
+        stats = self.get_data(self._STATS_KEY)
+        if isinstance(stats, dict) and isinstance(stats.get("days"), dict):
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        days: Dict[str, Any] = {}
+        note = f"统计自 {today} 起，升级前更早的历史领取记录没有金额，不回溯"
+        if today == self._SEED_DAY and self._today_count > 0:
+            days[today] = {"count": int(self._today_count), "magic": float(self._SEED_MAGIC)}
+            note = (f"{today} 升级前已领 {self._today_count} 个按当日群机器人汇总缓冲补记；"
+                    "此后按站点返回金额逐笔累计，更早历史不回溯")
+        self.__save_stats({
+            "version": 1,
+            "start_day": today,
+            "days": days,
+            "note": note,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def __record_grab(self, magic):
+        """每次成功领取后逐笔入账，按自然日分天，累计值由分天数据求和得出。"""
+        stats = self.get_data(self._STATS_KEY) or {}
+        day = datetime.now().strftime("%Y-%m-%d")
+        days = stats.setdefault("days", {})
+        if not isinstance(days, dict):
+            days = {}
+            stats["days"] = days
+        rec = days.setdefault(day, {"count": 0, "magic": 0.0})
+        rec["count"] = int(rec.get("count") or 0) + 1
+        rec["magic"] = float(rec.get("magic") or 0) + self.__parse_magic(magic)
+        stats.setdefault("start_day", day)
+        stats["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if len(days) > self._STATS_MAX_DAYS:
+            for old in sorted(days.keys())[:len(days) - self._STATS_MAX_DAYS]:
+                days.pop(old, None)
+        self.__save_stats(stats)
+
+    def __stats_summary(self) -> Dict[str, Any]:
+        stats = self.get_data(self._STATS_KEY) or {}
+        days = stats.get("days") or {}
+        if not isinstance(days, dict):
+            days = {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        cur = days.get(today) or {}
+        ordered = sorted(days.items())
+        return {
+            "today": today,
+            "today_count": int(cur.get("count") or 0),
+            "today_magic": float(cur.get("magic") or 0),
+            "days": len(ordered),
+            "total_count": sum(int(v.get("count") or 0) for _, v in ordered),
+            "total_magic": sum(float(v.get("magic") or 0) for _, v in ordered),
+            "start_day": stats.get("start_day") or today,
+            "note": stats.get("note") or "",
+            "recent": [
+                {"day": d, "count": int(v.get("count") or 0),
+                 "magic": float(v.get("magic") or 0)}
+                for d, v in ordered[-7:]
+            ],
+            "history": [
+                {"day": d, "count": int(v.get("count") or 0),
+                 "magic": float(v.get("magic") or 0)}
+                for d, v in ordered
+            ],
+        }
+
+    def __stats_api(self, api_result=None):
+        return api_result or {"success": True, "data": self.__stats_summary()}
+
     def __notify(self, title: str, text: str):
         if self._notify:
             try:
@@ -319,6 +441,7 @@ class TangGrabPacket(_PluginBase):
                     self._claimed_ids.add(str(pid))
                     self._today_count += 1
                     self.__save_state()
+                    self.__record_grab(magic)
                     grabbed.append({"id": pid, "sender": it.get("sender"),
                                     "magic": magic, "message": it.get("message")})
                     limit_note = (f"/{self._max_per_day}" if self._max_per_day > 0
@@ -520,11 +643,21 @@ class TangGrabPacket(_PluginBase):
 
     def get_page(self) -> List[dict]:
         results = self.get_data("grab_state") or {}
+        summary = self.__stats_summary()
+        fmt = self.__fmt_num
         history_note = f"今日已领取 {results.get('today_count') or 0} 个"
         if results.get("daily_limited"):
             history_note += " · 站点已达上限，明天 0 点自动恢复"
         elif not self._max_per_day:
             history_note += " · 不设上限（站点说了算）"
+        recent_lines = [
+            {
+                "component": "div",
+                "props": {"class": "text-body-2 mb-1"},
+                "text": f"{item['day']}　{int(item['count']):,} 个　{fmt(item['magic'])} 魔力",
+            }
+            for item in reversed(summary.get("recent") or [])
+        ] or [{"component": "div", "props": {"class": "text-body-2"}, "text": "暂无领取记录"}]
         return [
             {
                 "component": "VCard",
@@ -540,8 +673,53 @@ class TangGrabPacket(_PluginBase):
                             },
                             {
                                 "component": "div",
-                                "props": {"class": "text-body-2 text-muted"},
+                                "props": {"class": "text-h6 mb-1"},
+                                "text": f"今日 {int(summary['today_count']):,} 个 ｜ {fmt(summary['today_magic'])} 魔力"
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-subtitle-2"},
+                                "text": f"累计 {summary['days']} 天 ｜ {int(summary['total_count']):,} 个 ｜ "
+                                        f"{fmt(summary['total_magic'])} 魔力（自 {summary['start_day']} 起）"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "component": "VCard",
+                "props": {"class": "mt-3"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pa-4"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-subtitle-1 mb-2"},
+                                "text": "最近 7 天"
+                            }
+                        ] + recent_lines
+                    }
+                ]
+            },
+            {
+                "component": "VCard",
+                "props": {"class": "mt-3"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pa-4"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-body-2 text-muted mb-1"},
                                 "text": f"已领取记录 {len(self._claimed_ids)} 条（自动去重，防止重复领取）"
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-muted"},
+                                "text": summary.get("note") or "统计自插件 v1.1.0 起"
                             }
                         ]
                     }
