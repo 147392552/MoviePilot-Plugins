@@ -30,7 +30,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -322,7 +322,7 @@ class TangGrabPacket(_PluginBase):
             logger.error(f"不可躺抢红包：统计台账写入失败：{err}")
 
     def __init_stats(self):
-        """首次升级到 v1.1.0 时建立台账；当天已领的部分按汇总缓冲补记一次。"""
+        """首次启用带台账的版本时建立台账；当天已领的部分按汇总缓冲补记一次。"""
         stats = self.get_data(self._STATS_KEY)
         if isinstance(stats, dict) and isinstance(stats.get("days"), dict):
             return
@@ -719,7 +719,7 @@ class TangGrabPacket(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"class": "text-caption text-muted"},
-                                "text": summary.get("note") or "统计自插件 v1.1.0 起"
+                                "text": summary.get("note") or "统计自台账版本启用起"
                             }
                         ]
                     }
