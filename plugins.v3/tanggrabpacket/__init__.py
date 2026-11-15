@@ -130,7 +130,7 @@ class TangGrabPacket(_PluginBase):
                 "summary": "立即执行一轮抢红包",
             },
             {
-                "path": "/TangGrabPacket/stats",
+                "path": "/stats",
                 "endpoint": self.__stats_api,
                 "methods": ["GET"],
                 "auth": "bear",
