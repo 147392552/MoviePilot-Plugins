@@ -123,7 +123,7 @@ class SiteUpdateFeed(_PluginBase):
     plugin_name = "站点更新播报"
     plugin_desc = "汇总各 PT 站最近发布的种子，每天一条；只通知不下载，面板带每日新增台账。"
     plugin_icon = "https://raw.githubusercontent.com/147392552/MoviePilot-Plugins/main/icons/siteupdatefeed.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/147392552"
     plugin_config_prefix = "siteupdatefeed_"
@@ -216,7 +216,7 @@ class SiteUpdateFeed(_PluginBase):
         try:
             oper = SiteOper()
             all_sites = []
-            for method in ("get_services", "get_all", "get_sites", "get_enabled_sites"):
+            for method in ("select", "all", "list", "get_sites", "get_services", "get_all"):
                 func = getattr(oper, method, None)
                 if not callable(func):
                     continue
@@ -224,7 +224,11 @@ class SiteUpdateFeed(_PluginBase):
                     candidate = func()
                 except Exception:
                     continue
-                if isinstance(candidate, list) and candidate:
+                if not isinstance(candidate, list) or not candidate:
+                    continue
+                first = candidate[0]
+                domain = first.get("domain") if isinstance(first, dict) else getattr(first, "domain", None)
+                if domain:
                     all_sites = candidate
                     break
             if not all_sites:
@@ -638,7 +642,7 @@ class SiteUpdateFeed(_PluginBase):
             "site_ids": [],
             "rows": 50,
             "max_per_site": 8,
-            "max_total": 30,
+            "max_total": 20,
             "skip_local": True,
             "exclude_tags": "刷流",
             "first_notify": True,
