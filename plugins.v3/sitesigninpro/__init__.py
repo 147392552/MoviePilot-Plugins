@@ -17,6 +17,8 @@ MoviePilot 自带 AutoSignIn 只会 GET attendance.php 然后读页面文案，
   7. 支持「主页链接式签到」：学校 BTSCHOOL 等站点没有 attendance.php，
      签到入口是首页红色「每日签到」-> index.php?action=addbonus，
      提交后以按钮消失为成功凭据（v1.2.0 起）
+  8. v1.2.1：全部站点已签成功时也发当天日报；补签成功即时回报；
+     持久化按天台账 + 面板显示今日/累计/连续全勤天数（统计自升级日起）
 """
 import base64
 import hashlib
@@ -27,7 +29,7 @@ import re
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
@@ -186,7 +188,7 @@ class SiteSigninPro(_PluginBase):
     plugin_name = "站点签到助手"
     plugin_desc = "站点下拉多选（自动包含新增站点），支持 attendance.php 表单签到、Cloudflare 人机验证签到，以及学校等站的「主页每日签到」链接；按奖励文案或签到按钮消失判定结果"
     plugin_icon = "check.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "WorkBuddy"
     plugin_config_prefix = "sitesigninpro_"
     plugin_order = 33
@@ -208,7 +210,10 @@ class SiteSigninPro(_PluginBase):
     _dingtalk_secret = ""
     _notify_fail = True
     _notify_daily = False
+    _notify_recover = True
     _home_support = set()
+    _STATS_ENGINE = "1.2.1"
+    _STATS_KEEP_DAYS = 400
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -253,6 +258,7 @@ class SiteSigninPro(_PluginBase):
             "dingtalk_secret": self._dingtalk_secret,
             "notify_fail": self._notify_fail,
             "notify_daily": self._notify_daily,
+            "notify_recover": self._notify_recover,
         }
 
     def init_plugin(self, config: dict = None):
@@ -276,6 +282,7 @@ class SiteSigninPro(_PluginBase):
         self._dingtalk_secret = str(config.get("dingtalk_secret") or "").strip()
         self._notify_fail = bool(config.get("notify_fail", True))
         self._notify_daily = bool(config.get("notify_daily", False))
+        self._notify_recover = bool(config.get("notify_recover", True))
         self._home_support = set()
 
         run_now = bool(config.get("onlyonce"))
@@ -317,6 +324,13 @@ class SiteSigninPro(_PluginBase):
                 "auth": "bear",
                 "summary": "发送一条钉钉测试通知",
             },
+            {
+                "path": "/stats",
+                "endpoint": self.__stats_api,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "签到统计台账（今日/累计/连续全勤/最近7天，只读）",
+            },
         ]
 
     def __run_api(self, api_result=None):
@@ -324,6 +338,9 @@ class SiteSigninPro(_PluginBase):
 
     def __test_api(self, api_result=None):
         return api_result or {"success": True, "data": self.send_test()}
+
+    def __stats_api(self, api_result=None):
+        return api_result or {"success": True, "data": self.__stats_summary()}
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
@@ -693,6 +710,94 @@ class SiteSigninPro(_PluginBase):
             return {**base, "status": "error", "detail": f"{type(err).__name__}: {str(err)[:120]}"}
 
     # ------------------------------------------------------------------
+    # 持久化统计台账（v1.2.1）：按天覆盖写入，重复巡检不会重复计数
+    # ------------------------------------------------------------------
+    def __stats(self) -> Dict[str, Any]:
+        data = self.get_data("sign_stats") or {}
+        if not isinstance(data, dict):
+            data = {}
+        days = data.get("days")
+        if not isinstance(days, dict):
+            days = {}
+        return {"engine": self._STATS_ENGINE, "days": days}
+
+    def __save_stats(self, data: Dict[str, Any]):
+        days = data.get("days") or {}
+        if len(days) > self._STATS_KEEP_DAYS:
+            keep = sorted(days.keys())[-self._STATS_KEEP_DAYS:]
+            data["days"] = {d: days[d] for d in keep}
+        self.save_data("sign_stats", data)
+
+    def __record_stats(self, state: Dict[str, Any], today: str):
+        """用当天完整状态覆盖写入台账；升级当天从 sign_state 补记基线。"""
+        records = state.get("sites") or {}
+        if not records:
+            return
+        rows = list(records.values())
+        ok = [r for r in rows if r.get("status") in ("success", "already")]
+        bad = [r for r in rows if r.get("status") in ("error", "unknown")]
+        manual = [r for r in rows if r.get("status") == "manual"]
+        skipped = [r for r in rows if r.get("status") == "unsupported"]
+        rewards = {}
+        for r in ok:
+            if r.get("reward"):
+                rewards[r.get("site") or r.get("domain")] = r["reward"]
+        data = self.__stats()
+        prev = data["days"].get(today) or {}
+        now_hms = datetime.now().strftime("%H:%M:%S")
+        data["days"][today] = {
+            "total": len(rows),
+            "success": len(ok),
+            "failed": len(bad),
+            "manual": len(manual),
+            "skipped": len(skipped),
+            "rewards": rewards,
+            "first_at": prev.get("first_at") or now_hms,
+            "last_at": now_hms,
+        }
+        self.__save_stats(data)
+
+    def __stats_summary(self) -> Dict[str, Any]:
+        days = self.__stats()["days"]
+        ordered = sorted(days.items())
+        today = datetime.now().strftime("%Y-%m-%d")
+        cur = days.get(today) or {}
+        total_success = sum(int(v.get("success") or 0) for v in days.values())
+        total_failed = sum(int(v.get("failed") or 0) for v in days.values())
+        # 连续全勤天数：某天所有「有签到功能」的站点都成功才算全勤
+        streak = 0
+        cursor = datetime.strptime(today, "%Y-%m-%d")
+        if not cur:
+            cursor -= timedelta(days=1)
+        for _ in range(self._STATS_KEEP_DAYS):
+            key = cursor.strftime("%Y-%m-%d")
+            v = days.get(key)
+            target = int((v or {}).get("total") or 0) - int((v or {}).get("skipped") or 0)
+            if not v or target <= 0 or int(v.get("success") or 0) < target:
+                break
+            streak += 1
+            cursor -= timedelta(days=1)
+        return {
+            "today": today,
+            "today_total": int(cur.get("total") or 0),
+            "today_success": int(cur.get("success") or 0),
+            "today_failed": int(cur.get("failed") or 0),
+            "today_rewards": cur.get("rewards") or {},
+            "days": len(days),
+            "total_success": total_success,
+            "total_failed": total_failed,
+            "streak": streak,
+            "start_day": ordered[0][0] if ordered else "",
+            "recent": [
+                {"day": d, "total": int(v.get("total") or 0),
+                 "success": int(v.get("success") or 0),
+                 "failed": int(v.get("failed") or 0),
+                 "manual": int(v.get("manual") or 0)}
+                for d, v in ordered[-7:]
+            ],
+        }
+
+    # ------------------------------------------------------------------
     # 通知（钉钉加签）
     # ------------------------------------------------------------------
     @staticmethod
@@ -722,8 +827,9 @@ class SiteSigninPro(_PluginBase):
         ok, msg = self.__dingtalk_send(
             "站点签到助手测试通知",
             "### ✅ 站点签到助手已就绪\n\n"
-            "这是一条测试通知。每天会自动提交「立即签到」表单；\n"
-            "只有当某站需要人工处理（Cookie 失效 / 人机验证没过）时才会再发提醒。",
+            "这是一条测试通知。每天会自动签到并发送一条日报（全部成功也发）；\n"
+            "只有当某站需要人工处理（Cookie 失效 / 人机验证没过）时才会发失败提醒，"
+            "自动补签成功后会再发一条回报。",
         )
         logger.info(f"站点签到助手测试通知：{ok} {msg}")
 
@@ -731,12 +837,15 @@ class SiteSigninPro(_PluginBase):
         ok, msg = self.__dingtalk_send(
             "站点签到助手测试通知",
             "### ✅ 站点签到助手已就绪\n\n"
-            "这是一条测试通知。每天会自动提交「立即签到」表单；\n"
-            "只有当某站需要人工处理（Cookie 失效 / 人机验证没过）时才会再发提醒。",
+            "这是一条测试通知。每天会自动签到并发送一条日报（全部成功也发）；\n"
+            "只有当某站需要人工处理（Cookie 失效 / 人机验证没过）时才会发失败提醒，"
+            "自动补签成功后会再发一条回报。",
         )
         return {"success": ok, "message": msg}
 
-    def __notify(self, state: Dict[str, Any], results: List[Dict[str, Any]], daily: bool):
+    def __notify(self, state: Dict[str, Any], results: List[Dict[str, Any]], daily: bool,
+                 recovered: Optional[List[Dict[str, Any]]] = None):
+        """失败提醒 / 每日日报 / 补签成功回报，三者互不互相吞掉。"""
         problems = [r for r in results if r.get("status") in ("manual", "error", "unknown")]
         notified = set(state.get("notified") or [])
         fresh = [r for r in problems if f"{r['domain']}:{r['status']}" not in notified]
@@ -745,22 +854,48 @@ class SiteSigninPro(_PluginBase):
             md = ("### ⚠️ 有站点没能自动签到\n\n"
                   + "\n".join(lines)
                   + f"\n\n> {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-                    "插件会在下一次巡检自动重试，成功后不再提醒。")
+                    "插件会在下一次巡检自动重试，补签成功会再发一条回报。")
             ok, msg = self.__dingtalk_send("站点签到需要手动处理", md)
             logger.info(f"站点签到助手失败通知：{ok} {msg}")
             for r in fresh:
                 notified.add(f"{r['domain']}:{r['status']}")
             state["notified"] = sorted(notified)
+
+        rec_notified = set(state.get("recovered_notified") or [])
+        fresh_rec = [r for r in (recovered or []) if r.get("domain") not in rec_notified]
+        daily_sent = False
         if daily and self._notify_daily and not state.get("daily_notified"):
             ok_rows = [r for r in results if r.get("status") in ("success", "already")]
+            summary = self.__stats_summary()
             md = ("### ✅ 今日站点签到日报\n\n"
                   + "\n".join(
-                      f"- {r['site']}：{r.get('reward') or r['detail']}（{r.get('method') or '-'}）"
+                      f"- {r['site']}：{r.get('reward') or r.get('detail') or '-'}"
+                      f"（{r.get('method') or '-'}）"
                       for r in results)
                   + f"\n\n> 成功 {len(ok_rows)}/{len(results)} · "
+                    f"累计 {summary['days']} 天 / {summary['total_success']} 次签到 · "
+                    f"连续全勤 {summary['streak']} 天 · "
                     f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            if fresh_rec:
+                md += "\n\n> 本轮自动补签成功：" + "、".join(r["site"] for r in fresh_rec)
             self.__dingtalk_send("站点签到日报", md)
             state["daily_notified"] = True
+            daily_sent = True
+            logger.info("站点签到助手日报：已发送")
+
+        # 同一轮已经发了日报就不再单独发补签消息，避免一天两条
+        if fresh_rec and self._notify_recover and not daily_sent:
+            lines = [f"- **{r['site']}**：{r.get('reward') or r.get('detail') or '-'}"
+                     f"（{r.get('method') or '-'}）" for r in fresh_rec]
+            md = ("### ✅ 站点签到已自动补签成功\n\n"
+                  + "\n".join(lines)
+                  + f"\n\n> {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+                    "之前的失败提醒已自动重试成功，无需手动处理。")
+            self.__dingtalk_send("站点签到补签成功", md)
+            logger.info(f"站点签到助手补签成功回报：{len(fresh_rec)} 个站")
+        for r in fresh_rec:
+            rec_notified.add(r["domain"])
+        state["recovered_notified"] = sorted(rec_notified)
 
     # ------------------------------------------------------------------
     # 主流程
@@ -770,7 +905,7 @@ class SiteSigninPro(_PluginBase):
         state = self.get_data("sign_state") or {}
         if state.get("date") != today:
             state = {"date": today, "engine": _STATE_ENGINE, "sites": {},
-                     "notified": [], "daily_notified": False}
+                     "notified": [], "daily_notified": False, "recovered_notified": []}
         elif state.get("engine") != _STATE_ENGINE:
             # 插件升级：旧版把学校误判成「无签到功能」，这里清掉失败/跳过记录
             # 让新策略重新检查；已确认签到的记录保留，绝不重复提交表单。
@@ -792,16 +927,30 @@ class SiteSigninPro(_PluginBase):
                    not in ("success", "already", "unsupported")]
         skipped = len(sites) - len(pending)
         if not pending:
+            # v1.2.1：全部已签成功时也要记台账、更新最近运行时间；
+            # 每日定时（force=True）那一轮仍要发当天日报，不能静默跳过。
+            full = list(known.values())
+            state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.__record_stats(state, today)
+            self.save_data("sign_state", state)
+            if force:
+                self.__notify(state, full, daily=True)
+                self.save_data("sign_state", state)
             logger.info(f"站点签到助手：今日 {len(sites)} 站均已签到，跳过（不重复提交表单）")
             return {"date": today, "total": len(sites), "skipped": skipped,
-                    "results": list(known.values()), "last_run": state.get("last_run")}
+                    "results": full, "last_run": state.get("last_run")}
         sites = pending
 
         results: List[Dict[str, Any]] = []
+        recovered: List[Dict[str, Any]] = []
         for site in sites:
+            prev_status = (known.get(site["domain"]) or {}).get("status")
             result = self.__sign_site(site)
             results.append(result)
             known[result["domain"]] = result
+            if (prev_status in ("manual", "error", "unknown")
+                    and result["status"] in ("success", "already")):
+                recovered.append(result)
             label = {"success": "签到成功", "already": "今日已签", "manual": "需手动处理",
                      "error": "失败", "unknown": "无法判定",
                      "unsupported": "无签到功能(跳过)"}.get(result["status"], result["status"])
@@ -811,8 +960,9 @@ class SiteSigninPro(_PluginBase):
         state["sites"] = known
         state["home_support"] = sorted(self._home_support)
         state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.__record_stats(state, today)
         self.save_data("sign_state", state)
-        self.__notify(state, results, daily=force)
+        self.__notify(state, list(known.values()), daily=force, recovered=recovered)
         self.save_data("sign_state", state)
         return {
             "date": today,
@@ -868,7 +1018,7 @@ class SiteSigninPro(_PluginBase):
                                 "model": "dingtalk_secret", "label": "钉钉加签密钥 SEC"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
                             {"component": "VSelect", "props": {
                                 "chips": True,
                                 "multiple": True,
@@ -878,10 +1028,15 @@ class SiteSigninPro(_PluginBase):
                                 "hint": "自动列出站点管理里的全部站点，以后新增的站点也会出现在这里；"
                                         "选「全部站点」可一劳永逸，没有签到功能的站点会自动跳过",
                                 "persistent-hint": True}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSwitch", "props": {
                                 "model": "notify_daily", "label": "每天发签到日报",
-                                "hint": "默认关闭，避免刷屏；只在每日签到那一轮发一条汇总",
+                                "hint": "每天一条当天汇总；即使全部站点都已签成功也照常发送",
+                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {
+                                "model": "notify_recover", "label": "补签成功即时回报",
+                                "hint": "之前报过失败/需手动的站点，自动重试成功后单独发一条",
                                 "persistent-hint": True}}]},
                     ]},
                     {"component": "VRow", "content": [
@@ -920,6 +1075,7 @@ class SiteSigninPro(_PluginBase):
             "dingtalk_secret": "",
             "notify_fail": True,
             "notify_daily": False,
+            "notify_recover": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -949,6 +1105,21 @@ class SiteSigninPro(_PluginBase):
                 f"每 {self._retry_minutes} 分钟补签巡检 · "
                 f"{state.get('date') or '-'} 成功 {ok}/{len(targets)} · "
                 f"最近运行 {state.get('last_run') or '-'}")
+        summary = self.__stats_summary()
+        stat_line = (f"📊 今日 {summary['today_success']}/{summary['today_total'] or len(targets)} 成功 · "
+                     f"累计 {summary['days']} 天 / {summary['total_success']} 次签到 · "
+                     f"连续全勤 {summary['streak']} 天 · 累计失败 {summary['total_failed']} 次"
+                     f"（台账自 {summary['start_day'] or '升级当天'} 起）")
+        if summary["recent"]:
+            recent_line = "最近 7 天：" + "　".join(
+                f"{r['day'][5:]} {r['success']}/{r['total']}"
+                f"{'✅' if r['failed'] == 0 and r['manual'] == 0 and r['success'] > 0 else '⚠️'}"
+                for r in summary["recent"])
+        else:
+            recent_line = "最近 7 天：暂无记录（升级后开始累计）"
+        today_rewards = summary.get("today_rewards") or {}
+        reward_line = ("今日奖励：" + "　".join(f"{k} {v}" for k, v in today_rewards.items())
+                       if today_rewards else "今日奖励：暂无记录")
         return [{
             "component": "VCard",
             "content": [{
@@ -956,12 +1127,17 @@ class SiteSigninPro(_PluginBase):
                 "props": {"class": "pa-4"},
                 "content": [
                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold mb-2"},
-                     "text": "站点签到助手 · 今日状态"},
-                    {"component": "div", "props": {"class": "text-body-2 mb-3"}, "text": head},
+                     "text": "站点签到助手 · 今日状态与统计台账"},
+                    {"component": "div", "props": {"class": "text-body-2 mb-1"}, "text": head},
+                    {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold mt-3 mb-1"},
+                     "text": stat_line},
+                    {"component": "div", "props": {"class": "text-body-2 mb-1"}, "text": recent_line},
+                    {"component": "div", "props": {"class": "text-body-2 mb-3"}, "text": reward_line},
                     *rows,
                     {"component": "div", "props": {"class": "text-caption mt-3"},
                      "text": "Cookie 取自 MoviePilot 站点管理；带人机验证的站点使用真实浏览器提交。"
-                             "若某站显示「需手动处理」，点击钉钉提醒里的链接手动签一次即可，插件会在下一轮自动重试。"},
+                             "失败提醒按站点按天去重，自动补签成功会再发一条回报，每天定时发一条日报（全部成功也发）。"
+                             "台账按天持久化，面板常驻显示累计数据。"},
                 ],
             }],
         }]
