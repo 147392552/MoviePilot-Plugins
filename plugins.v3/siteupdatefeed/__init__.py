@@ -106,11 +106,24 @@ def build_message(by_site: List[Dict[str, Any]], total: int, skipped_local: int,
 # ----------------------------------------------------------------------
 # 插件主体
 # ----------------------------------------------------------------------
+class SiteLike:
+    """统一的站点视图，屏蔽 MP 不同版本的 SiteOper 返回类型差异"""
+
+    def __init__(self, sid: Any, name: Any, domain: Any, rss: Any):
+        self.id = sid
+        self.name = name or domain
+        self.domain = domain or ""
+        self.rss = rss or ""
+
+    def __repr__(self):
+        return f"<SiteLike {self.name} {self.domain}>"
+
+
 class SiteUpdateFeed(_PluginBase):
     plugin_name = "站点更新播报"
     plugin_desc = "汇总各 PT 站最近发布的种子，每天一条；只通知不下载，面板带每日新增台账。"
     plugin_icon = "https://raw.githubusercontent.com/147392552/MoviePilot-Plugins/main/icons/siteupdatefeed.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/147392552"
     plugin_config_prefix = "siteupdatefeed_"
@@ -198,19 +211,53 @@ class SiteUpdateFeed(_PluginBase):
     # 数据读取
     # ------------------------------------------------------------------
     def __target_sites(self) -> List[Any]:
-        """按配置筛选要播报的站点"""
+        """按配置筛选要播报的站点（兼容不同 MP 版本的 SiteOper 取法）"""
         sites = []
-        oper = SiteOper()
-        all_sites = oper.get_services() if hasattr(oper, "get_services") else []
-        if not all_sites:
-            all_sites = oper.get_all() if hasattr(oper, "get_all") else []
-        for site in all_sites or []:
-            sid = getattr(site, "id", None)
-            if self._site_ids and sid not in [int(x) for x in self._site_ids]:
-                continue
-            if not getattr(site, "rss", None) and not getattr(site, "domain", None):
-                continue
-            sites.append(site)
+        try:
+            oper = SiteOper()
+            all_sites = []
+            for method in ("get_services", "get_all", "get_sites", "get_enabled_sites"):
+                func = getattr(oper, method, None)
+                if not callable(func):
+                    continue
+                try:
+                    candidate = func()
+                except Exception:
+                    continue
+                if isinstance(candidate, list) and candidate:
+                    all_sites = candidate
+                    break
+            if not all_sites:
+                # 兜底：遍历所有 get_* 方法，找第一个返回站点列表的
+                for name in dir(oper):
+                    if not name.startswith("get"):
+                        continue
+                    func = getattr(oper, name, None)
+                    if not callable(func):
+                        continue
+                    try:
+                        candidate = func()
+                    except Exception:
+                        continue
+                    if not isinstance(candidate, list) or not candidate:
+                        continue
+                    first = candidate[0]
+                    domain = first.get("domain") if isinstance(first, dict) else getattr(first, "domain", None)
+                    if domain:
+                        all_sites = candidate
+                        break
+            for site in all_sites or []:
+                sid = getattr(site, "id", None) if not isinstance(site, dict) else site.get("id")
+                domain = getattr(site, "domain", None) if not isinstance(site, dict) else site.get("domain")
+                name = getattr(site, "name", None) if not isinstance(site, dict) else site.get("name")
+                rss = getattr(site, "rss", None) if not isinstance(site, dict) else site.get("rss")
+                if self._site_ids and sid not in [int(x) for x in self._site_ids]:
+                    continue
+                if not domain:
+                    continue
+                sites.append(SiteLike(sid, name, domain, rss))
+        except Exception as err:
+            logger.warning(f"站点更新播报：读取站点列表失败：{str(err)[:150]}")
         return sites
 
     @staticmethod
