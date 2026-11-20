@@ -123,7 +123,7 @@ class SiteUpdateFeed(_PluginBase):
     plugin_name = "站点更新播报"
     plugin_desc = "汇总各 PT 站最近发布的种子，每天一条；只通知不下载，面板带每日新增台账。"
     plugin_icon = "https://raw.githubusercontent.com/147392552/MoviePilot-Plugins/main/icons/siteupdatefeed.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/147392552"
     plugin_config_prefix = "siteupdatefeed_"
@@ -143,6 +143,7 @@ class SiteUpdateFeed(_PluginBase):
     _first_notify = True
     _notify = True
     _browse_supplement = False
+    _reset_baseline = False
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -174,6 +175,12 @@ class SiteUpdateFeed(_PluginBase):
         self._first_notify = bool(config.get("first_notify", True))
         self._notify = bool(config.get("notify", True))
         self._browse_supplement = bool(config.get("browse_supplement", False))
+        self._reset_baseline = bool(config.get("reset_baseline", False))
+        if self._reset_baseline:
+            self.save_data("feed_seen", {})
+            self.save_data("feed_stats", {})
+            self._reset_baseline = False
+            logger.info("站点更新播报：已重置基线与台账")
         if self._onlyonce:
             self._onlyonce = False
             self.update_config(self.__snapshot())
@@ -198,6 +205,7 @@ class SiteUpdateFeed(_PluginBase):
             "first_notify": self._first_notify,
             "notify": self._notify,
             "browse_supplement": self._browse_supplement,
+            "reset_baseline": self._reset_baseline,
         }
 
     def get_state(self) -> bool:
@@ -210,13 +218,27 @@ class SiteUpdateFeed(_PluginBase):
     # ------------------------------------------------------------------
     # 数据读取
     # ------------------------------------------------------------------
+    @staticmethod
+    def __as_list(value: Any) -> List[Any]:
+        """把 list / tuple / QuerySet 等统一成 list"""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        try:
+            return list(value)
+        except Exception:
+            return []
+
     def __target_sites(self) -> List[Any]:
         """按配置筛选要播报的站点（兼容不同 MP 版本的 SiteOper 取法）"""
         sites = []
         try:
             oper = SiteOper()
             all_sites = []
-            for method in ("select", "all", "list", "get_sites", "get_services", "get_all"):
+            for method in ("select", "all", "list", "query", "get_sites", "get_services", "get_all"):
                 func = getattr(oper, method, None)
                 if not callable(func):
                     continue
@@ -224,12 +246,13 @@ class SiteUpdateFeed(_PluginBase):
                     candidate = func()
                 except Exception:
                     continue
-                if not isinstance(candidate, list) or not candidate:
+                items = self.__as_list(candidate)
+                if not items:
                     continue
-                first = candidate[0]
+                first = items[0]
                 domain = first.get("domain") if isinstance(first, dict) else getattr(first, "domain", None)
                 if domain:
-                    all_sites = candidate
+                    all_sites = items
                     break
             if not all_sites:
                 # 兜底：遍历所有 get_* 方法，找第一个返回站点列表的
@@ -243,13 +266,23 @@ class SiteUpdateFeed(_PluginBase):
                         candidate = func()
                     except Exception:
                         continue
-                    if not isinstance(candidate, list) or not candidate:
+                    items = self.__as_list(candidate)
+                    if not items:
                         continue
-                    first = candidate[0]
+                    first = items[0]
                     domain = first.get("domain") if isinstance(first, dict) else getattr(first, "domain", None)
                     if domain:
-                        all_sites = candidate
+                        all_sites = items
                         break
+            if not all_sites:
+                # 最后兜底：直接查站点模型
+                try:
+                    from app.db.models.site import Site
+                    rows = self.__as_list(Site.query.all())
+                    if rows:
+                        all_sites = rows
+                except Exception:
+                    pass
             for site in all_sites or []:
                 sid = getattr(site, "id", None) if not isinstance(site, dict) else site.get("id")
                 domain = getattr(site, "domain", None) if not isinstance(site, dict) else site.get("domain")
@@ -524,6 +557,7 @@ class SiteUpdateFeed(_PluginBase):
         info = []
         try:
             oper = SiteOper()
+            info.append({"all_methods": [n for n in dir(oper) if not n.startswith("_")]})
             for name in dir(oper):
                 if not name.startswith("get"):
                     continue
@@ -624,6 +658,11 @@ class SiteUpdateFeed(_PluginBase):
                                                                  "hint": "补充首页置顶/老片位，请求更多、噪音略高"}}]},
                     ]},
                     {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VSwitch", "props": {"model": "reset_baseline", "label": "重置基线与台账",
+                                                                 "hint": "清空已播报记录与统计，重新开始计数"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal",
@@ -647,6 +686,7 @@ class SiteUpdateFeed(_PluginBase):
             "exclude_tags": "刷流",
             "first_notify": True,
             "browse_supplement": False,
+            "reset_baseline": False,
         }
 
     def get_page(self) -> List[dict]:
