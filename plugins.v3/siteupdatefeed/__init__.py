@@ -123,7 +123,7 @@ class SiteUpdateFeed(_PluginBase):
     plugin_name = "站点更新播报"
     plugin_desc = "汇总各 PT 站最近发布的种子，每天一条；只通知不下载，面板带每日新增台账。"
     plugin_icon = "https://raw.githubusercontent.com/147392552/MoviePilot-Plugins/main/icons/siteupdatefeed.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/147392552"
     plugin_config_prefix = "siteupdatefeed_"
@@ -253,7 +253,7 @@ class SiteUpdateFeed(_PluginBase):
                 rss = getattr(site, "rss", None) if not isinstance(site, dict) else site.get("rss")
                 if self._site_ids and sid not in [int(x) for x in self._site_ids]:
                     continue
-                if not domain:
+                if not domain or not name:
                     continue
                 sites.append(SiteLike(sid, name, domain, rss))
         except Exception as err:
@@ -506,7 +506,38 @@ class SiteUpdateFeed(_PluginBase):
                 "auth": "bear",
                 "summary": "立即采集一轮并推送",
             },
+            {
+                "path": "/diagnose",
+                "endpoint": self.__diagnose_api,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "站点列表读取诊断",
+            },
         ]
+
+    def __diagnose_api(self, api_result=None):
+        """列出 SiteOper 各取法返回的条数，便于确认站点来源是否正确"""
+        info = []
+        try:
+            oper = SiteOper()
+            for name in dir(oper):
+                if not name.startswith("get"):
+                    continue
+                func = getattr(oper, name, None)
+                if not callable(func):
+                    continue
+                try:
+                    candidate = func()
+                except Exception:
+                    continue
+                if not isinstance(candidate, list) or not candidate:
+                    continue
+                first = candidate[0]
+                keys = list(first.keys())[:8] if isinstance(first, dict) else [a for a in dir(first) if not a.startswith("_")][:8]
+                info.append({"method": name, "count": len(candidate), "sample_keys": keys})
+        except Exception as err:
+            return {"success": False, "message": str(err)[:150]}
+        return {"success": True, "data": {"methods": info, "target_sites": len(self.__target_sites())}}
 
     def __stats_api(self, api_result=None):
         return api_result or {"success": True, "data": self.__stats_summary()}
