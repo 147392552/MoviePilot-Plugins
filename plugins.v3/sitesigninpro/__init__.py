@@ -188,7 +188,7 @@ class SiteSigninPro(_PluginBase):
     plugin_name = "站点签到助手"
     plugin_desc = "站点下拉多选（自动包含新增站点），支持 attendance.php 表单签到、Cloudflare 人机验证签到，以及学校等站的「主页每日签到」链接；按奖励文案或签到按钮消失判定结果"
     plugin_icon = "check.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "WorkBuddy"
     plugin_config_prefix = "sitesigninpro_"
     plugin_order = 33
@@ -350,17 +350,26 @@ class SiteSigninPro(_PluginBase):
                 "id": "SiteSigninProDaily",
                 "name": "站点签到助手-每日签到",
                 "trigger": CronTrigger(hour=self._cron_hour, minute=self._cron_minute),
-                "func": self.__run_safe,
-                "kwargs": {"force": True},
+                # 不依赖 kwargs：MP 调度不一定透传 kwargs，force 必须由专用方法决定
+                "func": self.__run_daily,
+                "kwargs": {},
             },
             {
                 "id": "SiteSigninProRetry",
                 "name": "站点签到助手-补签巡检",
                 "trigger": IntervalTrigger(minutes=self._retry_minutes),
-                "func": self.__run_safe,
-                "kwargs": {"force": False},
+                "func": self.__run_retry,
+                "kwargs": {},
             },
         ]
+
+    def __run_daily(self):
+        """每日定时签到：force=True，负责发当天日报"""
+        self.__run_safe(force=True)
+
+    def __run_retry(self):
+        """补签巡检：force=False，只补当天未成功的站"""
+        self.__run_safe(force=False)
 
     def stop_service(self):
         pass
@@ -864,7 +873,12 @@ class SiteSigninPro(_PluginBase):
         rec_notified = set(state.get("recovered_notified") or [])
         fresh_rec = [r for r in (recovered or []) if r.get("domain") not in rec_notified]
         daily_sent = False
-        if daily and self._notify_daily and not state.get("daily_notified"):
+        should_daily = self._notify_daily and not state.get("daily_notified")
+        if should_daily and not daily:
+            # 非每日轮次：只有过了日报时点后一小时仍未发出，才补发
+            if datetime.now().hour < (self._cron_hour + 1) % 24:
+                should_daily = False
+        if should_daily:
             ok_rows = [r for r in results if r.get("status") in ("success", "already")]
             summary = self.__stats_summary()
             md = ("### ✅ 今日站点签到日报\n\n"
@@ -878,10 +892,13 @@ class SiteSigninPro(_PluginBase):
                     f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
             if fresh_rec:
                 md += "\n\n> 本轮自动补签成功：" + "、".join(r["site"] for r in fresh_rec)
-            self.__dingtalk_send("站点签到日报", md)
-            state["daily_notified"] = True
-            daily_sent = True
-            logger.info("站点签到助手日报：已发送")
+            ok, msg = self.__dingtalk_send("站点签到日报", md)
+            if ok:
+                state["daily_notified"] = True
+                daily_sent = True
+                logger.info("站点签到助手日报：已发送")
+            else:
+                logger.warning(f"站点签到助手日报发送失败：{msg}")
 
         # 同一轮已经发了日报就不再单独发补签消息，避免一天两条
         if fresh_rec and self._notify_recover and not daily_sent:
