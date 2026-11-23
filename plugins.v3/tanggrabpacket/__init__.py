@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 import urllib3
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.log import logger
@@ -30,7 +31,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -47,6 +48,10 @@ class TangGrabPacket(_PluginBase):
     _notify = True
     _cookie = ""
     _onlyonce = False
+    # 每日战报：固定时间发一条当日领取战报，不依赖站点上限是否触发
+    _daily_report = True
+    _daily_report_hour = 20
+    _daily_report_minute = 30
 
     _lock = threading.Lock()
     _session = None
@@ -85,6 +90,9 @@ class TangGrabPacket(_PluginBase):
         self._notify = bool(config.get("notify", True))
         self._cookie = (config.get("cookie") or self.__get_site_cookie() or "").strip()
         self._onlyonce = bool(config.get("onlyonce", False))
+        self._daily_report = bool(config.get("daily_report", True))
+        self._daily_report_hour = max(0, min(23, self.__safe_int(config.get("daily_report_hour"), 20, min_value=0)))
+        self._daily_report_minute = max(0, min(59, self.__safe_int(config.get("daily_report_minute"), 30, min_value=0)))
 
         # 载入持久化数据（已领取记录 / 今日计数）
         data = self.get_data("grab_state") or {}
@@ -110,6 +118,9 @@ class TangGrabPacket(_PluginBase):
                 "notify": self._notify,
                 "cookie": config.get("cookie", ""),
                 "onlyonce": False,
+                "daily_report": self._daily_report,
+                "daily_report_hour": self._daily_report_hour,
+                "daily_report_minute": self._daily_report_minute,
             })
             threading.Thread(target=self.grab_once, daemon=True).start()
 
@@ -145,7 +156,7 @@ class TangGrabPacket(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
-        return [
+        services = [
             {
                 "id": "TangGrabPacket",
                 "name": "不可躺抢红包轮询",
@@ -154,6 +165,38 @@ class TangGrabPacket(_PluginBase):
                 "kwargs": {}
             }
         ]
+        if self._daily_report:
+            services.append(
+                {
+                    "id": "TangGrabPacketDailyReport",
+                    "name": "不可躺抢红包-每日战报",
+                    "trigger": CronTrigger(hour=self._daily_report_hour, minute=self._daily_report_minute),
+                    "func": self.__daily_report_task,
+                    "kwargs": {}
+                }
+            )
+        return services
+
+    def __daily_report_task(self):
+        """每天固定时间发一条当日战报：没达到站点上限也能看到今天领了多少"""
+        try:
+            summary = self.__stats_summary()
+            if not summary.get("today_count"):
+                logger.info("不可躺抢红包：今日暂无领取记录，跳过每日战报")
+                return
+            magic = self.__fmt_num(summary.get("today_magic") or 0)
+            total_magic = self.__fmt_num(summary.get("total_magic") or 0)
+            text = (
+                "### 📊 今日领取战报\n\n"
+                f"今日领取 **{summary.get('today_count')}** 个 · **{magic}** 魔力\n\n"
+                f"> 累计 {summary.get('days')} 天 · {summary.get('total_count')} 个 · "
+                f"{total_magic} 魔力（统计自 {summary.get('start_day')} 起）\n"
+                f"> {datetime.now().strftime('%Y-%m-%d %H:%M')} · 只统计已成功领取"
+            )
+            self.post_message(mtype=NotificationType.Plugin, title="【今日领取战报】", text=text)
+            logger.info(f"不可躺抢红包：每日战报已发送（{summary.get('today_count')} 个 / {magic} 魔力）")
+        except Exception as err:
+            logger.error(f"不可躺抢红包：每日战报发送失败：{err}")
 
     def __grab_task(self):
         try:
@@ -589,6 +632,60 @@ class TangGrabPacket(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "daily_report",
+                                            "label": "每天发领取战报",
+                                            "hint": "固定时间发一条当日战报，不等站点上限触发",
+                                            "persistent-hint": True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "daily_report_hour",
+                                            "label": "战报小时(0-23)",
+                                            "type": "number",
+                                            "min": 0,
+                                            "max": 23,
+                                            "persistent-hint": True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "daily_report_minute",
+                                            "label": "战报分钟(0-59)",
+                                            "type": "number",
+                                            "min": 0,
+                                            "max": 59,
+                                            "persistent-hint": True
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "interval",
@@ -636,6 +733,9 @@ class TangGrabPacket(_PluginBase):
             "enabled": self._enabled,
             "notify": self._notify,
             "onlyonce": False,
+            "daily_report": self._daily_report,
+            "daily_report_hour": self._daily_report_hour,
+            "daily_report_minute": self._daily_report_minute,
             "interval": self._interval,
             "max_per_day": self._max_per_day,
             "cookie": "",
