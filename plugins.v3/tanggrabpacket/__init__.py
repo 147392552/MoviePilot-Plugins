@@ -31,7 +31,7 @@ class TangGrabPacket(_PluginBase):
     plugin_name = "不可躺抢红包"
     plugin_desc = "自动监测不可躺站点群聊区红包，PoW验证后自动拆红包，支持通知到微信。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "WorkBuddy"
     author_url = ""
     plugin_config_prefix = "tanggrabpacket_"
@@ -434,8 +434,9 @@ class TangGrabPacket(_PluginBase):
     def __stats_api(self, api_result=None):
         return api_result or {"success": True, "data": self.__stats_summary()}
 
-    def __notify(self, title: str, text: str):
-        if self._notify:
+    def __notify(self, title: str, text: str, force: bool = False):
+        """force=True 的关键消息（如已达上限）无视逐条通知开关，始终推送"""
+        if self._notify or force:
             try:
                 self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
             except Exception as err:
@@ -518,8 +519,8 @@ class TangGrabPacket(_PluginBase):
                         self.__notify(
                             "【不可躺抢红包】今日已达站点领取上限",
                             f"站点返回：{msg}\n今日已领 {self._today_count} 个\n"
-                            f"已停止领取，明天 0 点自动恢复"
-                        )
+                            f"已停止领取，明天 0 点自动恢复",
+                            force=True)
                         break
                     if "登录" in msg or "失效" in msg or "cookie" in msg.lower():
                         return {"success": False, "message": f"Cookie疑似失效：{msg}"}
